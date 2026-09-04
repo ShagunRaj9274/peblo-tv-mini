@@ -1,0 +1,247 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend — lint and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+
+      - name: Install
+        working-directory: backend
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint
+        working-directory: backend
+        run: ruff check app tests
+
+      # The suite runs on SQLite so it needs no service container and finishes in
+      # seconds. The Postgres-specific paths (advisory locks) have SQLite
+      # fallbacks that are exercised here; the migration job below is what proves
+      # the real schema applies to real Postgres.
+      - name: Tests
+        working-directory: backend
+        run: python -m pytest -q
+
+  migrations:
+    name: Migrations apply to Postgres
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: peblo
+          POSTGRES_PASSWORD: peblo
+          POSTGRES_DB: peblo
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U peblo" --health-interval 5s
+          --health-timeout 3s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - working-directory: backend
+        run: pip install -r requirements.txt
+      # upgrade then downgrade then upgrade: catches a migration that is only
+      # written in one direction, which is the one you find out about at 2am.
+      - name: alembic upgrade / downgrade / upgrade
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql+psycopg://peblo:peblo@localhost:5432/peblo
+        run: |
+          alembic upgrade head
+          alembic downgrade base
+          alembic upgrade head
+
+  frontends:
+    name: Frontends — typecheck and build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        app: [cms, viewer]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ${{ matrix.app }}/package-lock.json
+      - working-directory: ${{ matrix.app }}
+        run: npm ci
+      - name: Typecheck
+        working-directory: ${{ matrix.app }}
+        run: npx tsc --noEmit
+      - name: Build
+        working-directory: ${{ matrix.app }}
+        run: npm run build
+
+  stack:
+    name: docker compose up actually works
+    runs-on: ubuntu-latest
+    needs: [backend, frontends]
+    steps:
+      - uses: actions/checkout@v4
+      # The brief says compose must work first try, so CI proves it on every
+      # push rather than trusting that it worked on my laptop.
+      - name: Bring the stack up
+        run: docker compose up --build -d
+
+      - name: Wait for the API to be healthy
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8000/health >/dev/null; then exit 0; fi
+            sleep 2
+          done
+          docker compose logs
+          exit 1
+
+      - name: Smoke test the published catalogue
+        run: |
+          set -e
+          curl -fsS http://localhost:8000/health/ready | tee /dev/stderr | grep -q '"status":"ok"'
+          # Seeded stack auto-publishes, so the viewer's endpoint must return shows.
+          test "$(curl -fsS http://localhost:8000/catalog | python3 -c 'import sys,json; print(json.load(sys.stdin)["counts"]["shows"])')" -gt 0
+          curl -fsS "http://localhost:8000/catalog/search?q=kite" >/dev/null
+          curl -fsS http://localhost:5173 >/dev/null
+          curl -fsS http://localhost:5174 >/dev/null
+
+      - name: Editor cannot publish
+        run: |
+          TOKEN=$(curl -fsS -X POST http://localhost:8000/auth/login \
+            -H 'Content-Type: application/json' \
+            -d '{"email":"editor@peblo.tv","password":"peblo-editor"}' \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            http://localhost:8000/admin/catalog/publish -H "Authorization: Bearer $TOKEN")
+          test "$CODE" = "403"
+
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  images:
+    name: Build and push images
+    runs-on: ubuntu-latest
+    needs: [backend, frontends, migrations]
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: backend/Dockerfile
+          push: true
+          # Tagged by commit SHA, never `latest`: a deploy names an exact build,
+          # so a rollback is redeploying a tag rather than rebuilding and hoping.
+          tags: ghcr.io/${{ github.repository }}/api:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: CMS image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: cms/Dockerfile
+          push: true
+          build-args: |
+            VITE_API_BASE_URL=${{ vars.API_BASE_URL }}
+            VITE_VIEWER_URL=${{ vars.VIEWER_URL }}
+          tags: ghcr.io/${{ github.repository }}/cms:${{ github.sha }}
+
+      - name: Viewer image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: viewer/Dockerfile
+          push: true
+          build-args: |
+            VITE_API_BASE_URL=${{ vars.API_BASE_URL }}
+          tags: ghcr.io/${{ github.repository }}/viewer:${{ github.sha }}
+
+  deploy:
+    name: Deploy (written, not wired to a cloud)
+    runs-on: ubuntu-latest
+    needs: [images, stack]
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      # A GitHub Environment with a required reviewer is the approval gate. The
+      # job pauses here until someone approves, so `main` is always deployable
+      # without every merge going out unattended.
+    steps:
+      - uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      # This job is deliberately not connected to a real cloud account. What
+      # follows is what it would run, and why it is in this order.
+      # ------------------------------------------------------------------
+      - name: What this step would do
+        run: |
+          cat <<'PLAN'
+          Target: the API and both static frontends on a container platform
+          (Fly.io / ECS / Cloud Run all work; the shape is the same).
+
+          1. Assume a deploy role via OIDC.
+             uses: aws-actions/configure-aws-credentials with role-to-assume.
+             No long-lived cloud keys live in GitHub secrets — the runner mints a
+             short-lived token from its OIDC identity. The only secret this repo
+             actually needs is the registry token, which GitHub provides.
+
+          2. Run migrations as their own task, before any new code serves traffic:
+             docker run <api:sha> alembic upgrade head
+             Migrations must be backward compatible with the running version,
+             because for a minute both versions are live. That means additive
+             changes only: add a nullable column, backfill, switch reads, drop the
+             old column in a later deploy. A migration that renames or drops in one
+             step is the thing that turns a deploy into an outage.
+
+          3. Roll out the API, one instance at a time, with the health check as the
+             gate: an instance only receives traffic once GET /health/ready returns
+             200. If a new instance never goes ready, the rollout stops and the old
+             ones keep serving.
+
+          4. Publish the two frontends. They are static bundles behind a CDN, so
+             this is an upload plus a cache invalidation. Note that VITE_API_BASE_URL
+             is baked in at build time, so a frontend image is environment-specific
+             — that is why the build-args above come from GitHub Environment vars.
+
+          5. Smoke test against the real deployment, the same checks the `stack`
+             job runs locally: /health/ready is ok, /catalog returns shows, and an
+             editor token gets 403 from the publish endpoint.
+
+          6. Roll back on failure by redeploying the previous SHA tag. The catalogue
+             itself does not need rolling back with it — it is a separate immutable
+             file in R2, and the CMS has its own rollback button that re-points the
+             catalog/current pointer at an earlier run.
+          PLAN

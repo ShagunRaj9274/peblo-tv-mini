@@ -1,0 +1,62 @@
+{
+  "_note": "Reconstructed from the challenge brief. Drop the official reference.json here to override — the loader reads this file at seed time and the API validates against it at runtime.",
+  "sections": [
+    "Continue Watching",
+    "New on Peblo",
+    "Learn Along",
+    "Stories & Rhymes",
+    "Big Kid Adventures",
+    "Made in India"
+  ],
+  "categories": [
+    "Adventure",
+    "Comedy",
+    "Educational",
+    "Fantasy",
+    "Music",
+    "Nature",
+    "Mystery",
+    "Preschool"
+  ],
+  "languages": [
+    "en",
+    "hi",
+    "ta",
+    "te",
+    "bn",
+    "mr"
+  ],
+  "artwork": {
+    "poster": {
+      "aspect_ratio": "2:3",
+      "target_width": 600,
+      "target_height": 900,
+      "max_bytes": 204800,
+      "surface": "catalogue rows"
+    },
+    "banner": {
+      "aspect_ratio": "16:9",
+      "target_width": 1280,
+      "target_height": 720,
+      "max_bytes": 204800,
+      "surface": "featured hero"
+    },
+    "thumbnail": {
+      "aspect_ratio": "16:9",
+      "target_width": 640,
+      "target_height": 360,
+      "max_bytes": 204800,
+      "surface": "episode lists"
+    }
+  },
+  "artwork_tolerance": {
+    "aspect_ratio_tolerance": 0.02,
+    "dimension_tolerance_pct": 0.1,
+    "allowed_mime_types": ["image/jpeg", "image/png", "image/webp"]
+  },
+  "conventions": {
+    "trailer_season_number": 0,
+    "trailer_season_note": "Season 0 is reserved for trailers. It is never rendered as a normal season in the viewer UI.",
+    "content_group_note": "Episodes sharing a content_group are language variants of the same episode. They collapse into a single catalogue entry that lists its available languages."
+  }
+}
