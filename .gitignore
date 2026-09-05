@@ -8,4 +8,4 @@ dist/
 .env
 *.db
 .DS_Store
-storage/
+/storage/
