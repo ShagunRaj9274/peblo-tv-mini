@@ -7,7 +7,13 @@ from app.config import settings
 from app.models import Base
 
 config = context.config
-config.set_main_option("sqlalchemy.url", settings.database_url.replace("%", "%%"))
+
+config.set_main_option(
+    "sqlalchemy.url",
+    settings.database_url.replace("%", "%%").replace(
+        "postgresql://", "postgresql+psycopg://", 1
+    ),
+)
 
 if config.config_file_name:
     fileConfig(config.config_file_name)
